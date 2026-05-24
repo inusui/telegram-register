@@ -1,0 +1,167 @@
+name: Auto Version & Changelog
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [ opened, synchronize, reopened ]
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: auto-version-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    env:
+      CREDENTIALS_FILE: "credentials.json"
+      GOOGLE_SHEET_ID: "dummy"
+      SHEET_NAME: "dummy"
+      TESSERACT_PATH: "/usr/bin/tesseract"
+      TELEGRAM_TOKEN: "dummy"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+  bump-version:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    needs: tests
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.ACTIONS_TELEGRAM_REGISTER }}
+
+      - name: Collect commit messages
+        id: commits
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            MESSAGES=$(git log origin/main..HEAD --pretty=format:"%s")
+          else
+            MESSAGES=$(git log ${{ github.event.before }}..${{ github.event.after }} --pretty=format:"%s" 2>/dev/null || git log -1 --pretty=format:"%s")
+          fi
+          echo "messages<<EOF" >> $GITHUB_OUTPUT
+          echo "$MESSAGES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "--- Commits detectados ---"
+          echo "$MESSAGES"
+
+      - name: Determine version bump type
+        id: bump_type
+        run: |
+          MESSAGES="${{ steps.commits.outputs.messages }}"
+          if echo "$MESSAGES" | grep -qiE "^breaking(\(.+\))?:"; then
+            echo "type=major" >> $GITHUB_OUTPUT
+          elif echo "$MESSAGES" | grep -qiE "^feat(\(.+\))?:"; then
+            echo "type=minor" >> $GITHUB_OUTPUT
+          elif echo "$MESSAGES" | grep -qiE "^fix(\(.+\))?:"; then
+            echo "type=patch" >> $GITHUB_OUTPUT
+          else
+            echo "type=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Calculate new version
+        id: version
+        if: steps.bump_type.outputs.type != 'none'
+        run: |
+          CURRENT=$(python3 .github/scripts/get_version.py)
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          BUMP="${{ steps.bump_type.outputs.type }}"
+          if [ "$BUMP" = "major" ]; then NEW="$((MAJOR + 1)).0.0"
+          elif [ "$BUMP" = "minor" ]; then NEW="${MAJOR}.$((MINOR + 1)).0"
+          else NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+          echo "Version: $CURRENT -> $NEW"
+
+      # ── Solo en PR: comentar vista previa ─────────────────────────────────
+      - name: Comment version preview on PR
+        if: github.event_name == 'pull_request' && steps.bump_type.outputs.type != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT="${{ steps.version.outputs.current }}"
+          NEW="${{ steps.version.outputs.new }}"
+          BUMP="${{ steps.bump_type.outputs.type }}"
+          BODY="## 🤖 Vista previa de versión
+          
+          | | |
+          |---|---|
+          | **Versión actual** | \`$CURRENT\` |
+          | **Nueva versión** | \`$NEW\` |
+          | **Tipo de bump** | \`$BUMP\` |
+          
+          *Este comentario se actualiza con cada push al PR.*"
+          
+          COMMENT_ID=$(gh pr view ${{ github.event.pull_request.number }} --json comments \
+            --jq '.comments[] | select(.author.login == "github-actions[bot]") | .id' | head -1)
+          if [ -n "$COMMENT_ID" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/$COMMENT_ID -X PATCH -f body="$BODY"
+          else
+            gh pr comment ${{ github.event.pull_request.number }} --body "$BODY"
+          fi
+
+      - name: Comment no bump on PR
+        if: github.event_name == 'pull_request' && steps.bump_type.outputs.type == 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "## 🤖 Vista previa de versión
+            ⚠️ Ningún commit usa prefijos convencionales (\`fix:\`, \`feat:\`, \`breaking:\`). Si mergeas este PR **no se actualizará la versión**."
+
+      # ── Solo en push a main: actualizar info.py y crear Release ───────────
+      - name: Update info.py
+        if: github.event_name == 'push' && steps.bump_type.outputs.type != 'none'
+        run: |
+          OLD="${{ steps.version.outputs.current }}"
+          NEW="${{ steps.version.outputs.new }}"
+          sed -i "s/VERSION = \"$OLD\"/VERSION = \"$NEW\"/" info.py
+
+      - name: Commit and push
+        if: github.event_name == 'push' && steps.bump_type.outputs.type != 'none'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add info.py
+          git commit -m "chore: bump version to ${{ steps.version.outputs.new }} [skip ci]"
+          git push
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && steps.bump_type.outputs.type != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.version.outputs.new }}" \
+            --title "v${{ steps.version.outputs.new }}" \
+            --generate-notes
+
+      - name: No bump needed
+        if: steps.bump_type.outputs.type == 'none'
+        run: echo "No fix/feat/breaking prefix found. Skipping version bump."
