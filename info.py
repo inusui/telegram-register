@@ -1,4 +1,4 @@
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 """
 # 1 = Versión mayor (cambios que rompen compatibilidad)
 # 2 = Versión menor (nuevas características compatibles)
