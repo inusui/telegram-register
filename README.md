@@ -1,4 +1,4 @@
-# 🤖 Bot de Telegram para Registro de Facturas
+# 🤖 Bot de Telegram para Registro de Facturas.
 
 Bot automatizado de Telegram que extrae información de facturas mediante OCR y las registra automáticamente en Google Sheets.
 
